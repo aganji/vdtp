@@ -24,6 +24,7 @@ def fragmentData(serialData,reliable):
     flowId = randint(1,63)
     print 'Flow Id:',flowId
     retBuf = []
+
     if len(serialData) > FRAG_SIZE:
         #print "Fragmenting Data"
         current = 0
@@ -33,30 +34,28 @@ def fragmentData(serialData,reliable):
             if current + FRAG_SIZE > len(serialData):
                 lastFrag = 1
             if seq > 63:
-                seq = 0
-            #print seq,lastFrag
+                seq = 0 # Ideally should drop whole packet
+            
             seqHdr = (seq<<2) + (reliable << 1) + lastFrag
-            #print seqHdr
             header = struct.pack('BB',flowId,seqHdr)
             retBuf.append(header + serialData[current:current+FRAG_SIZE])
             current += FRAG_SIZE
             seq += 1
     else:
         header = struct.pack('BB',flowId,(reliable << 1) + 1)
-        #print len(header)
         retBuf.append(header + serialData)
 
     return retBuf
 
 def ackThread(fragDataList,sk,addr):
-    #print 'Ack thread created'
     totalPackets = len(fragDataList)
     lastCompleteAck = -1
     count = 0
-    sk.settimeout(2)
+    timeout = 2
     timeoutVal = 0
     while True:
         try:
+            sk.settimeout(timeout)
             ackPacket, retAddr = sk.recvfrom(2)
 
             if retAddr == addr:
@@ -78,6 +77,7 @@ def ackThread(fragDataList,sk,addr):
                 break
             print 'Timeout Occured'
             timeoutVal += 1
+            timeout = timeout*2
             for x in range(lastCompleteAck+1,totalPackets):
                 sk.sendto(fragDataList[x],addr)
 
@@ -136,37 +136,54 @@ class Server:
         while True:
             data,addr = sk.recvfrom(1500)
             flowId,seq,reliable,lastFrag = extractHeader(data[0:2])
-            if ackCount.has_key((addr,flowId)):
-                ackCount[(addr,flowId)] += 1
-            else:
-                ackCount[(addr,flowId)] = 1
-            length = len(data)
+            if reliable == 1:
+                if ackCount.has_key((addr,flowId)):
+                    ackCount[(addr,flowId)] += 1
+                else:
+                    ackCount[(addr,flowId)] = 1
 
             # Send back ack
-            if ackCount[(addr,flowId)]%2 == 0 or lastFrag == 1:
+            if reliable == 1 and (ackCount[(addr,flowId)]%2 == 0 or lastFrag == 1):
                 sendAck(flowId,seq,addr,sk)
 
             if (addr,flowId) in completedFlows:
                 print 'in completed flow'
                 continue
 
+            length = len(data)
+
             # In order delivery
             if flowIdList.has_key((addr,flowId)):
-                flowIdList[(addr,flowId)][seq] = data[2:length]
+                flowIdList[(addr,flowId)][0][seq] = data[2:length]
             else:
-                flowIdList[(addr,flowId)] = {}
-                flowIdList[(addr,flowId)][seq] = data[2:length]
-
+                flowIdList[(addr,flowId)] = [{},-1] #dictionary to hold data, last fragment seq number
+                flowIdList[(addr,flowId)][0][seq] = data[2:length]
+            
+            # If last fragment -> set last fragment sequence number
             if lastFrag == 1:
-                for x in range(0,64):
-                    if flowIdList[(addr,flowId)].has_key(x):
-                        output += flowIdList[(addr,flowId)][x]
-                    else:
-                        del flowIdList[(addr,flowId)]
+                flowIdList[(addr,flowId)][1] = seq
+
+            # If last fragment is received, check for full packet
+            if flowIdList[(addr,flowId)][1] != -1:
+                flag = False
+
+                # check if all fragments are present
+                for x in range(0,flowIdList[(addr,flowId)][1]+1):
+                    if not flowIdList[(addr,flowId)][0].has_key(x):
+                        flag = True
+                
+                # All fragments are present when flag is false
+                if not flag:
+                    for x in range(0,flowIdList[(addr,flowId)][1]+1):
+                        if flowIdList[(addr,flowId)][0].has_key(x):
+                            output += flowIdList[(addr,flowId)][0][x]
+
+                    del flowIdList[(addr,flowId)]
+                    if ackCount.has_key((addr,flowId)):
                         del ackCount[(addr,flowId)]
-                        completedFlows.append((addr,flowId))
-                        break
-                returnBuf = pickle.loads(output)
-                output = ''
-                if self.on_recv:
-                    self.on_recv(returnBuf,(addr,flowId))
+                    completedFlows.append((addr,flowId))
+                    returnBuf = pickle.loads(output)
+                    output = ''
+                    if self.on_recv:
+                        self.on_recv(returnBuf,(addr,flowId))
+
